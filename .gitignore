@@ -1,0 +1,11 @@
+# artefacts de build locaux
+build*/
+*.log
+__pycache__/
+*.wav
+*.opus
+*.ogg
+# secrets — ne jamais committer de clé
+.mistral-key
+*.key
+env*

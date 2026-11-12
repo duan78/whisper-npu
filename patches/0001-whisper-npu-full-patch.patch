@@ -1,0 +1,672 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 8525d0e..17058be 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -92,6 +92,7 @@ option(WHISPER_COREML                "whisper: enable Core ML framework"  OFF)
+ option(WHISPER_COREML_ALLOW_FALLBACK "whisper: allow non-CoreML fallback" OFF)
+ option(WHISPER_OPENVINO              "whisper: support for OpenVINO"      OFF)
+ option(WHISPER_VITISAI               "whisper: support for AMD Vitis AI"  OFF)
++option(WHISPER_PIPELINE              "whisper: NPU inter-file pipelining (prefetch next file during CPU decode)" OFF)
+ 
+ # Required for relocatable CMake package
+ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/build-info.cmake)
+diff --git a/examples/cli/CMakeLists.txt b/examples/cli/CMakeLists.txt
+index 3a73776..18e157b 100644
+--- a/examples/cli/CMakeLists.txt
++++ b/examples/cli/CMakeLists.txt
+@@ -3,6 +3,10 @@ add_executable(${TARGET} cli.cpp)
+ 
+ include(DefaultTargetOptions)
+ 
++if (WHISPER_PIPELINE)
++    add_definitions(-DWHISPER_PIPELINE)
++endif()
++
+ target_link_libraries(${TARGET} PRIVATE common whisper ${FFMPEG_LIBRARIES} ${CMAKE_THREAD_LIBS_INIT})
+ 
+ install(TARGETS ${TARGET} RUNTIME)
+diff --git a/examples/cli/cli.cpp b/examples/cli/cli.cpp
+index 4e84c1b..2cec6de 100644
+--- a/examples/cli/cli.cpp
++++ b/examples/cli/cli.cpp
+@@ -1069,6 +1069,30 @@ int main(int argc, char ** argv) {
+         }
+     }
+ 
++#ifdef WHISPER_PIPELINE
++    // pipeline inter-fichiers : lecture anticipée du fichier suivant ; son prefetch NPU est
++    // déclenché par callback au moment où le thread principal entre en phase de décode.
++    // Désactivable à l'exécution via la variable d'environnement WHISPER_NO_PIPELINE (A/B tests).
++    const bool pipeline_enabled = (getenv("WHISPER_NO_PIPELINE") == nullptr) && !params.diarize;
++    std::vector<float> pcmf32_next;
++    std::string        pcmf32_next_fname;
++
++    struct pipe_launcher {
++        whisper_context * ctx           = nullptr;
++        const float     * samples       = nullptr;
++        int               n_samples     = 0;
++        bool              valid         = false;
++        std::atomic<bool> launched{false};
++
++        static void launch(void * user_data) {
++            struct pipe_launcher * self = (struct pipe_launcher *) user_data;
++            if (self->valid && !self->launched.exchange(true)) {
++                whisper_pipeline_prefetch(self->ctx, self->samples, self->n_samples);
++            }
++        }
++    };
++#endif
++
+     for (int f = 0; f < (int) params.fname_inp.size(); ++f) {
+         const auto & fname_inp = params.fname_inp[f];
+         struct fout_factory {
+@@ -1123,11 +1147,38 @@ int main(int argc, char ** argv) {
+         std::vector<float> pcmf32;               // mono-channel F32 PCM
+         std::vector<std::vector<float>> pcmf32s; // stereo-channel F32 PCM
+ 
++#ifdef WHISPER_PIPELINE
++        if (pipeline_enabled && !pcmf32_next_fname.empty() && pcmf32_next_fname == fname_inp) {
++            // ce fichier a déjà été lu à l'avance : on récupère le buffer tel quel
++            // (même pointeur que celui du prefetch, condition de la consommation du pipeline)
++            pcmf32 = std::move(pcmf32_next);
++            pcmf32_next_fname.clear();
++        } else
++#endif
+         if (!::read_audio_data(fname_inp, pcmf32, pcmf32s, params.diarize)) {
+             fprintf(stderr, "error: failed to read audio file '%s'\n", fname_inp.c_str());
+             continue;
+         }
+ 
++#ifdef WHISPER_PIPELINE
++        // lecture anticipée du fichier suivant ; le prefetch NPU sera lancé par le callback
++        // de décode (le moment optimal : le NPU est alors inoccupé jusqu'au prochain encode)
++        pipe_launcher launcher;
++        if (pipeline_enabled && f + 1 < (int) params.fname_inp.size()) {
++            pcmf32_next.clear();
++            std::vector<std::vector<float>> stereo_next;
++            if (::read_audio_data(params.fname_inp[f + 1], pcmf32_next, stereo_next, params.diarize)) {
++                pcmf32_next_fname = params.fname_inp[f + 1];
++                launcher.ctx      = ctx;
++                launcher.samples  = pcmf32_next.data();
++                launcher.n_samples = (int) pcmf32_next.size();
++                launcher.valid    = true;
++            } else {
++                pcmf32_next_fname.clear();
++            }
++        }
++#endif
++
+         if (!whisper_is_multilingual(ctx)) {
+             if (params.language != "en" || params.translate) {
+                 params.language = "en";
+@@ -1167,6 +1218,12 @@ int main(int argc, char ** argv) {
+         {
+             whisper_full_params wparams = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
+ 
++#ifdef WHISPER_PIPELINE
++            // le callback lance le prefetch NPU du fichier suivant dès l'entrée en décode
++            wparams.pipeline_prefetch_callback        = pipe_launcher::launch;
++            wparams.pipeline_prefetch_callback_user_data = &launcher;
++#endif
++
+             const bool use_grammar = (!params.grammar_parsed.rules.empty() && !params.grammar_rule.empty());
+             wparams.strategy = (params.beam_size > 1 || use_grammar) ? WHISPER_SAMPLING_BEAM_SEARCH : WHISPER_SAMPLING_GREEDY;
+ 
+diff --git a/examples/server/server.cpp b/examples/server/server.cpp
+index b77d8a3..ffe850b 100644
+--- a/examples/server/server.cpp
++++ b/examples/server/server.cpp
+@@ -940,7 +940,7 @@ int main(int argc, char ** argv) {
+ 
+             wparams.suppress_nst     = params.suppress_nst;
+ 
+-            wparams.vad              = params.vad;
++            wparams.vad              = false; // PATCH: le VAD de ce fork segfault dans whisper_vad ; VAD live géré côté orchestrateur (Silero)
+             wparams.vad_model_path   = params.vad_model.c_str();
+ 
+             wparams.vad_params.threshold               = params.vad_threshold;
+diff --git a/include/whisper.h b/include/whisper.h
+index f4cc6bf..634992e 100644
+--- a/include/whisper.h
++++ b/include/whisper.h
+@@ -279,6 +279,18 @@ extern "C" {
+                                int   n_samples,
+                                int   n_threads);
+ 
++#ifdef WHISPER_PIPELINE
++    // Précalcul asynchrone (pipeline inter-fichiers) : mel + encodeur NPU de la première fenêtre
++    // du FICHIER SUIVANT, exécuté pendant la phase de décode CPU du fichier courant.
++    // Le forward NPU ne démarre qu'une fois le thread principal en phase de décode, et ne se
++    // concurrence jamais avec ses propres encodes (mutex interne). Le résultat est consommé
++    // automatiquement par le prochain whisper_full() appelé avec les MÊMES pointeur/taille samples.
++    WHISPER_API void whisper_pipeline_prefetch(
++            struct whisper_context * ctx,
++                       const float * samples,
++                               int   n_samples);
++#endif
++
+     WHISPER_API int whisper_pcm_to_mel_with_state(
+             struct whisper_context * ctx,
+               struct whisper_state * state,
+@@ -578,6 +590,13 @@ extern "C" {
+         whisper_logits_filter_callback logits_filter_callback;
+         void * logits_filter_callback_user_data;
+ 
++#ifdef WHISPER_PIPELINE
++        // appelé au début de chaque phase de décode : LE moment de lancer le prefetch NPU
++        // du fichier suivant (voir whisper_pipeline_prefetch)
++        void (* pipeline_prefetch_callback)(void * user_data);
++        void * pipeline_prefetch_callback_user_data;
++#endif
++
+         const whisper_grammar_element ** grammar_rules;
+         size_t                           n_grammar_rules;
+         size_t                           i_start_rule;
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 6cba1c6..105686d 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -150,6 +150,19 @@ if (CMAKE_CXX_BYTE_ORDER STREQUAL "BIG_ENDIAN")
+     set(WHISPER_EXTRA_FLAGS ${WHISPER_EXTRA_FLAGS} -DWHISPER_BIG_ENDIAN)
+ endif()
+ 
++if (WHISPER_PIPELINE)
++    set(WHISPER_EXTRA_FLAGS ${WHISPER_EXTRA_FLAGS} -DWHISPER_PIPELINE)
++endif()
++
++if (WHISPER_ORT_ONNX AND ORT_SDK)
++    target_include_directories(whisper PRIVATE ${ORT_SDK}/include)
++    target_include_directories(whisper.vitisai PRIVATE ${ORT_SDK}/include)
++    target_link_libraries(whisper PRIVATE ${ORT_SDK}/lib/onnxruntime.lib)
++    set(WHISPER_EXTRA_FLAGS ${WHISPER_EXTRA_FLAGS} -DWHISPER_ORT_ONNX)
++    # le code ORT est compilé par la cible whisper.vitisai : il faut le define aussi
++    target_compile_options(whisper.vitisai PRIVATE -DWHISPER_ORT_ONNX)
++endif()
++
+ if (WHISPER_EXTRA_FLAGS)
+     target_compile_options(whisper PRIVATE ${WHISPER_EXTRA_FLAGS})
+ endif()
+diff --git a/src/vitisai/whisper-vitisai-encoder.cpp b/src/vitisai/whisper-vitisai-encoder.cpp
+index a6d20a8..af0b5f4 100644
+--- a/src/vitisai/whisper-vitisai-encoder.cpp
++++ b/src/vitisai/whisper-vitisai-encoder.cpp
+@@ -14,13 +14,28 @@
+     #include <fcntl.h>
+ #endif
+ #include <cstring>
++#include <memory>
+ #include <string>
++#include <vector>
++
++#ifdef WHISPER_ORT_ONNX
++// Mode ONNX : encodeur compilé/exécuté via ONNX Runtime + VitisAI EP (Ryzen AI SDK)
++#include "onnxruntime/core/session/onnxruntime_cxx_api.h"
++#endif
+ 
+ struct whisper_vitisai_context {
+     std::string model_path;
+     std::shared_ptr<flexmlrt::client::Model> runner;
+-    uint8_t * fbs_buffer;
+-    size_t fbs_buffer_size;
++    uint8_t * fbs_buffer = nullptr;
++    size_t fbs_buffer_size = 0;
++
++#ifdef WHISPER_ORT_ONNX
++    bool use_ort = false;
++    std::unique_ptr<Ort::Env> ort_env;
++    std::unique_ptr<Ort::Session> ort_session;
++    std::vector<std::string> in_names, out_names;
++    std::vector<const char *> in_c, out_c;
++#endif
+ };
+ 
+ // Function to mmap rai file for Linux and MapViewOfFile for Windows
+@@ -111,13 +126,45 @@ struct whisper_vitisai_context * whisper_vitisai_init(const char * path_model) {
+         }
+     }
+ 
++#ifdef WHISPER_ORT_ONNX
++    // Mode ONNX Runtime + VitisAI EP (modèle auto-compilé par le SDK, ex: fenêtre réduite)
++    if (ctx->model_path.size() > 5 &&
++        ctx->model_path.compare(ctx->model_path.size() - 5, 5, ".onnx") == 0) {
++        ctx->use_ort = true;
++        try {
++            ctx->ort_env = std::make_unique<Ort::Env>(ORT_LOGGING_LEVEL_ERROR, "whisper-npu");
++            Ort::SessionOptions so;
++            so.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
++            so.SetIntraOpNumThreads(4);
++            std::unordered_map<std::string, std::string> pov; // options par défaut
++            so.AppendExecutionProvider("VitisAI", pov);
++            // ORTCHAR_T = wchar_t sous Windows
++            std::wstring wpath(ctx->model_path.begin(), ctx->model_path.end());
++            ctx->ort_session = std::make_unique<Ort::Session>(*ctx->ort_env, wpath.c_str(), so);
++            Ort::AllocatorWithDefaultOptions alloc;
++            auto in_name  = ctx->ort_session->GetInputNameAllocated(0, alloc);
++            auto out_name = ctx->ort_session->GetOutputNameAllocated(0, alloc);
++            ctx->in_names.emplace_back(in_name.get());
++            ctx->out_names.emplace_back(out_name.get());
++            ctx->in_c  = { ctx->in_names[0].c_str() };
++            ctx->out_c = { ctx->out_names[0].c_str() };
++            std::fprintf(stderr, "%s: ORT ONNX encoder (VitisAI EP) prêt: %s\n", __func__, ctx->model_path.c_str());
++        } catch (const std::exception & e) {
++            std::fprintf(stderr, "%s: ORT session error: %s\n", __func__, e.what());
++            delete ctx;
++            return nullptr;
++        }
++        return ctx;
++    }
++#endif
++
+     // Step 1: Set up the model
+     flexmlrt::client::Options options;
+     options.modelPath = ctx->model_path;
+     options.deviceName = "stx";
+     options.debug = false;
+     options.executeMode = 2;
+-    options.extOptions["ai_analyzer_profiling"] = true; // Enable AIA profiling
++    options.extOptions["ai_analyzer_profiling"] = false; // Disable AIA profiling: crashes without AIE metadata JSON
+     options.extOptions["enable_preemption"] = true;
+ 
+     // Check if model_path is rai file and if so, add fbs_buffer and fbs_buffer_size to the options
+@@ -164,6 +211,30 @@ void whisper_vitisai_free(struct whisper_vitisai_context * ctx) {
+ }
+ 
+ int whisper_vitisai_encode(struct whisper_vitisai_context * ctx, struct ggml_tensor * mel, struct ggml_tensor * out) {
++#ifdef WHISPER_ORT_ONNX
++    if (ctx->use_ort) {
++        // mel ggml: [ne[0]=frames, ne[1]=canaux] contigu -> ONNX [1, canaux, frames]
++        const int64_t frames = mel->ne[0];
++        const int64_t chans  = mel->ne[1];
++        std::fprintf(stderr, "%s: [ORT debug] mel ne = [%lld x %lld], attendu ONNX [1 x 128 x N]\n",
++                     __func__, (long long) frames, (long long) chans);
++        int64_t in_dims[3] = { 1, chans, frames };
++        try {
++            Ort::MemoryInfo mi = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
++            Ort::Value in = Ort::Value::CreateTensor<float>(mi, (float *) mel->data,
++                                                            frames * chans, in_dims, 3);
++            auto outs = ctx->ort_session->Run(Ort::RunOptions{ nullptr },
++                                              ctx->in_c.data(), &in, 1,
++                                              ctx->out_c.data(), 1);
++            const size_t n = outs[0].GetTensorTypeAndShapeInfo().GetElementCount();
++            memcpy(out->data, outs[0].GetTensorData<float>(), n * sizeof(float));
++        } catch (const std::exception & e) {
++            std::fprintf(stderr, "%s: ORT inference error: %s\n", __func__, e.what());
++            return 0;
++        }
++        return 1;
++    }
++#endif
+     if (!ctx || !mel || !out) {
+         std::fprintf(stderr, "%s: ctx/mel/out must not be null\n", __func__);
+         return 0;
+diff --git a/src/whisper.cpp b/src/whisper.cpp
+index aa8be2b..cb0ee03 100644
+--- a/src/whisper.cpp
++++ b/src/whisper.cpp
+@@ -37,6 +37,10 @@
+ #include <string>
+ #include <thread>
+ #include <vector>
++#ifdef WHISPER_PIPELINE
++#include <condition_variable>
++#include <mutex>
++#endif
+ 
+ #ifdef _MSC_VER
+ #include <codecvt>
+@@ -881,6 +885,18 @@ struct whisper_state {
+     // result of the encoder
+     struct ggml_tensor * embd_conv = nullptr;
+     struct ggml_tensor * embd_enc  = nullptr;
++#ifdef WHISPER_PIPELINE
++    // pipelining inter-fichiers : prefetch mel + encode NPU de la 1re fenêtre du fichier suivant,
++    // exécuté pendant la phase de décode CPU du fichier courant
++    ggml_context      * pipe_ctx       = nullptr;  // propriétaire de pipe_embd_enc
++    struct ggml_tensor * pipe_embd_enc = nullptr;  // double buffer de sortie du forward NPU du worker
++    std::thread         pipe_thread;
++    std::atomic<bool>   pipe_active{false};        // worker en cours d'exécution
++    std::atomic<bool>   pipe_valid{false};         // résultat du worker utilisable
++    const float       * pipe_samples   = nullptr;  // identité des samples prefetchés
++    int                 pipe_n_samples = 0;
++    whisper_mel         pipe_mel;                  // mel précalculé par le worker
++#endif
+ 
+     // helpers for GPU offloading
+     std::vector<float> inp_mel;
+@@ -2359,10 +2375,102 @@ static struct ggml_cgraph * whisper_build_graph_cross(
+     return gf;
+ }
+ 
++#ifdef WHISPER_PIPELINE
++// Sérialisation de l'accès NPU (main + worker de prefetch). Le mutex fait office de queue :
++// chaque forward exécuté par le worker est un forward que le thread principal n'aura pas à faire.
++static std::mutex              g_pipe_npu_mutex;
++static std::mutex              g_pipe_phase_mutex;
++static std::condition_variable g_pipe_phase_cv;
++static bool                    g_pipe_main_decoding = false;
++
++// Partie conv + forward NPU d'une fenêtre, extraite de whisper_encode_internal.
++// Écrit le résultat dans embd_out (double buffer) au lieu de wstate.embd_enc.
++// DOIT être appelée sous g_pipe_npu_mutex (touche sched_conv, inp_mel, wstate.mel et le context NPU).
++static bool whisper_encode_conv_npu(
++        whisper_context & wctx,
++          whisper_state & wstate,
++              const int   mel_offset,
++              const int   n_threads,
++    struct ggml_tensor   * embd_out) {
++    const int64_t t_start_us = ggml_time_us();
++
++    auto & sched = wstate.sched_conv.sched;
++
++    ggml_cgraph * gf = whisper_build_graph_conv(wctx, wstate);
++
++    if (!ggml_backend_sched_alloc_graph(sched, gf)) {
++        // should never happen as we pre-allocate the memory
++        return false;
++    }
++
++    struct ggml_tensor * mel = ggml_graph_get_tensor(gf, "mel");
++
++    // set the input
++    {
++        const auto & mel_inp = wstate.mel;
++        const int n_ctx      = wstate.exp_n_audio_ctx > 0 ? wstate.exp_n_audio_ctx : wctx.model.hparams.n_audio_ctx;
++
++        wstate.inp_mel.resize(ggml_nelements(mel));
++
++        float * dst = wstate.inp_mel.data();
++        memset(dst, 0, ggml_nbytes(mel));
++
++        const int i0 = std::min(mel_offset,           mel_inp.n_len);
++        const int i1 = std::min(mel_offset + 2*n_ctx, mel_inp.n_len);
++
++        for (int j = 0; j < mel_inp.n_mel; ++j) {
++            for (int i = i0; i < i1; ++i) {
++                dst[j*2*n_ctx + (i - i0)] = mel_inp.data[j*mel_inp.n_len + i];
++            }
++        }
++
++        ggml_backend_tensor_set(mel, wstate.inp_mel.data(), 0, ggml_nelements(mel)*sizeof(float));
++    }
++
++    ggml_backend_sched_reset(sched);
++
++#if defined(WHISPER_USE_VITISAI)
++    const bool ok = whisper_vitisai_encode(wstate.ctx_vitisai, mel, embd_out) == 1;
++#else
++    (void) n_threads;
++    const bool ok = false; // le pipeline ne sert que pour l'encodeur externe NPU
++#endif
++    if (ok) {
++        wstate.t_encode_us += ggml_time_us() - t_start_us;
++        wstate.n_encode++;
++    }
++    return ok;
++}
++
++// Phase cross seule, utilisée à la consommation d'une fenêtre pré-encodée par le worker.
++static bool whisper_encode_cross(
++        whisper_context & wctx,
++          whisper_state & wstate,
++              const int   n_threads) {
++    const int64_t t_start_us = ggml_time_us();
++
++    auto & sched = wstate.sched_cross.sched;
++
++    ggml_cgraph * gf = whisper_build_graph_cross(wctx, wstate);
++
++    if (!ggml_backend_sched_alloc_graph(sched, gf)) {
++        return false;
++    }
++
++    if (!ggml_graph_compute_helper(sched, gf, n_threads)) {
++        return false;
++    }
++
++    wstate.t_encode_us += ggml_time_us() - t_start_us;
++
++    return true;
++}
++#endif // WHISPER_PIPELINE
++
+ // evaluate the encoder with the given state
+ //
+ // given audio recording (more specifically, its log mel spectrogram), runs forward pass of the encoder
+-// part of the transformer model and returns the encoded features
++// part of the transformer and returns the encoded features
+ //
+ //   - wctx:      the model
+ //   - wstate:     the state of the encoder
+@@ -2379,6 +2487,15 @@ static bool whisper_encode_internal(
+     const int64_t t_start_us = ggml_time_us();
+ 
+     // conv
++#ifdef WHISPER_PIPELINE
++    // sérialise l'accès NPU avec le worker de prefetch (queue implicite)
++    // et signale la sortie de la phase de décode au worker
++    std::unique_lock<std::mutex> pipe_npu_lock(g_pipe_npu_mutex);
++    {
++        std::lock_guard<std::mutex> lk(g_pipe_phase_mutex);
++        g_pipe_main_decoding = false;
++    }
++#endif
+     {
+         auto & sched = wstate.sched_conv.sched;
+ 
+@@ -2433,6 +2550,10 @@ static bool whisper_encode_internal(
+         }
+     }
+ 
++#ifdef WHISPER_PIPELINE
++    pipe_npu_lock.unlock();
++#endif
++
+     // encoder
+     if (!whisper_encode_external(wstate)) {
+         auto & sched = wstate.sched_encode.sched;
+@@ -3498,6 +3619,24 @@ struct whisper_state * whisper_init_state(whisper_context * ctx) {
+     }
+ #endif
+ 
++#ifdef WHISPER_PIPELINE
++    // double buffer pour la sortie du forward NPU du worker de prefetch (pipeline inter-fichiers)
++    {
++        const int n_state = ctx->model.hparams.n_audio_state;
++        const int n_ctx   = ctx->model.hparams.n_audio_ctx;
++        const size_t nbytes = (size_t) n_state * n_ctx * sizeof(float);
++
++        struct ggml_init_params iparams = {
++            /*.mem_size   =*/ ggml_tensor_overhead() + nbytes + 1024,
++            /*.mem_buffer =*/ nullptr,
++            /*.no_alloc   =*/ false,
++        };
++
++        state->pipe_ctx = ggml_init(iparams);
++        state->pipe_embd_enc = ggml_new_tensor_2d(state->pipe_ctx, GGML_TYPE_F32, n_state, n_ctx);
++    }
++#endif
++
+     state->logits.reserve(ctx->vocab.n_vocab * ctx->model.hparams.n_text_ctx);
+ 
+     state->batch = whisper_batch_init(ctx->model.hparams.n_text_ctx, WHISPER_MAX_DECODERS);
+@@ -3846,6 +3985,16 @@ struct whisper_context * whisper_init_no_state(struct whisper_model_loader * loa
+ 
+ void whisper_free_state(struct whisper_state * state) {
+     if (state) {
++#ifdef WHISPER_PIPELINE
++        if (state->pipe_active) {
++            state->pipe_thread.join();
++            state->pipe_active = false;
++        }
++        if (state->pipe_ctx != nullptr) {
++            ggml_free(state->pipe_ctx);
++            state->pipe_ctx = nullptr;
++        }
++#endif
+         whisper_kv_cache_free(state->kv_self);
+         whisper_kv_cache_free(state->kv_cross);
+         whisper_kv_cache_free(state->kv_pad);
+@@ -3935,6 +4084,58 @@ int whisper_pcm_to_mel(struct whisper_context * ctx, const float * samples, int
+     return whisper_pcm_to_mel_with_state(ctx, ctx->state, samples, n_samples, n_threads);
+ }
+ 
++#ifdef WHISPER_PIPELINE
++void whisper_pipeline_prefetch(struct whisper_context * ctx, const float * samples, int n_samples) {
++    struct whisper_state * state = ctx->state;
++
++    // un seul worker à la fois : on attend l'éventuel prefetch précédent
++    if (state->pipe_active) {
++        state->pipe_thread.join();
++        state->pipe_active = false;
++    }
++    state->pipe_valid = false;
++
++    if (samples == nullptr || n_samples <= 0) {
++        return;
++    }
++
++    state->pipe_samples   = samples;
++    state->pipe_n_samples = n_samples;
++
++    state->pipe_thread = std::thread([ctx, state, samples, n_samples]() {
++        // 1) mel spectrogramme du fichier suivant (CPU, buffers privés du worker)
++        whisper_mel & mel = state->pipe_mel;
++        if (!log_mel_spectrogram(*state, samples, n_samples, WHISPER_SAMPLE_RATE, WHISPER_N_FFT,
++                                 WHISPER_HOP_LENGTH, ctx->model.filters.n_mel, 4, ctx->model.filters, false, mel)) {
++            return; // pipe_valid reste false -> whisper_full retombera sur le chemin normal
++        }
++
++        // 2) attendre que le thread principal entre en phase de décode (le prefetch n'est
++        //    normalement lancé que via le callback de décode, donc ce signal est déjà posé ;
++        //    il protège aussi contre tout lancement externe prématuré)
++        {
++            std::unique_lock<std::mutex> lk(g_pipe_phase_mutex);
++            g_pipe_phase_cv.wait(lk, [] { return g_pipe_main_decoding; });
++        }
++
++        // 3) conv + forward NPU de la 1re fenêtre, en exclusion avec les encodes du thread
++        //    principal. Le mutex fait office de queue NPU : si le main encode, le worker
++        //    attend ; si le main décode (CPU), le worker avance — recouvrement.
++        {
++            std::lock_guard<std::mutex> lk(g_pipe_npu_mutex);
++
++            // bascule temporaire du mel du state (non lu par le main pendant son décode)
++            std::swap(state->mel, state->pipe_mel);
++            const bool ok = whisper_encode_conv_npu(*ctx, *state, 0, 4, state->pipe_embd_enc);
++            std::swap(state->mel, state->pipe_mel);
++
++            state->pipe_valid = ok;
++        }
++    });
++    state->pipe_active = true;
++}
++#endif
++
+ int whisper_set_mel_with_state(
+         struct whisper_context * ctx,
+           struct whisper_state * state,
+@@ -6038,6 +6239,10 @@ struct whisper_full_params whisper_full_default_params(enum whisper_sampling_str
+ 
+         /*.logits_filter_callback           =*/ nullptr,
+         /*.logits_filter_callback_user_data =*/ nullptr,
++#ifdef WHISPER_PIPELINE
++        /*.pipeline_prefetch_callback            =*/ nullptr,
++        /*.pipeline_prefetch_callback_user_data  =*/ nullptr,
++#endif
+ 
+         /*.grammar_rules   =*/ nullptr,
+         /*.n_grammar_rules =*/ 0,
+@@ -6872,7 +7077,36 @@ int whisper_full_with_state(
+ 
+     result_all.clear();
+ 
++#ifdef WHISPER_PIPELINE
++    // consommer un éventuel prefetch lancé pour ces samples : mel et 1re fenêtre déjà encodés sur NPU
++    bool pipe_first = false;
++    if (state->pipe_active) {
++        // anti-deadlock : si le worker attend encore la phase de décode, le réveiller
++        // (son forward se fera sous mutex avant notre join — coût nul, résultat consommé)
++        {
++            std::lock_guard<std::mutex> lk(g_pipe_phase_mutex);
++            g_pipe_main_decoding = true;
++        }
++        g_pipe_phase_cv.notify_all();
++        state->pipe_thread.join();
++        state->pipe_active = false;
++    }
++    if (state->pipe_valid && state->pipe_samples == samples && state->pipe_n_samples == n_samples && n_samples > 0) {
++        std::swap(state->mel, state->pipe_mel);
++        if (state->embd_enc != nullptr && state->pipe_embd_enc != nullptr) {
++            std::swap(state->embd_enc->data, state->pipe_embd_enc->data);
++        }
++        pipe_first = true;
++    }
++    state->pipe_valid = false;
++#endif
++
+     if (n_samples > 0) {
++#ifdef WHISPER_PIPELINE
++        if (pipe_first) {
++            // le mel a été précalculé par le worker de prefetch : rien à faire
++        } else
++#endif
+         // compute log mel spectrogram
+         if (whisper_pcm_to_mel_with_state(ctx, state, samples, n_samples, params.n_threads) != 0) {
+             WHISPER_LOG_ERROR("%s: failed to compute log mel spectrogram\n", __func__);
+@@ -7089,6 +7323,16 @@ int whisper_full_with_state(
+         }
+ 
+         // encode audio features starting at offset seek
++#ifdef WHISPER_PIPELINE
++        if (pipe_first) {
++            // fenêtre pré-encodée par le worker NPU : seule la phase cross reste à calculer
++            if (!whisper_encode_cross(*ctx, *state, params.n_threads)) {
++                WHISPER_LOG_ERROR("%s: failed to encode (pipeline cross)\n", __func__);
++                return -6;
++            }
++            pipe_first = false;
++        } else
++#endif
+         if (!whisper_encode_internal(*ctx, *state, seek, params.n_threads, params.abort_callback, params.abort_callback_user_data)) {
+             WHISPER_LOG_ERROR("%s: failed to encode\n", __func__);
+             return -6;
+@@ -7101,6 +7345,19 @@ int whisper_full_with_state(
+             prompt_past1.clear();
+         }
+ 
++#ifdef WHISPER_PIPELINE
++        // le thread principal entre en phase de décode : c'est LE moment de lancer le
++        // prefetch du fichier suivant (via callback) pour recouvrir son forward NPU
++        {
++            std::lock_guard<std::mutex> lk(g_pipe_phase_mutex);
++            g_pipe_main_decoding = true;
++        }
++        g_pipe_phase_cv.notify_all();
++        if (params.pipeline_prefetch_callback) {
++            params.pipeline_prefetch_callback(params.pipeline_prefetch_callback_user_data);
++        }
++#endif
++
+         int best_decoder_id = 0;
+ 
+         for (int it = 0; it < (int) temperatures.size(); ++it) {
+@@ -7819,7 +8076,9 @@ int whisper_full(
+                            int   n_samples) {
+ 
+     std::vector<float> vad_samples;
+-    if (params.vad) {
++    // PATCH fork AMD : le VAD segfault dans whisper_vad — désactivé par défaut,
++    // réactivable via WHISPER_ALLOW_VAD=1 (le VAD live appartient à l'orchestrateur).
++    if (params.vad && getenv("WHISPER_ALLOW_VAD") != nullptr) {
+         WHISPER_LOG_INFO("%s: VAD is enabled, processing speech segments only\n", __func__);
+         if (!whisper_vad(ctx, ctx->state, params, samples, n_samples, vad_samples)) {
+             WHISPER_LOG_ERROR("%s: failed to compute VAD\n", __func__);
+@@ -7847,7 +8106,7 @@ int whisper_full_parallel(
+     }
+ 
+     std::vector<float> vad_samples;
+-    if (params.vad) {
++    if (params.vad && getenv("WHISPER_ALLOW_VAD") != nullptr) { // PATCH fork AMD: VAD segfault, opt-in via env
+         WHISPER_LOG_INFO("%s: VAD is enabled, processing speech segments only\n", __func__);
+         if (!whisper_vad(ctx, ctx->state, params, samples, n_samples, vad_samples)) {
+             WHISPER_LOG_ERROR("%s: failed to compute VAD\n", __func__);
