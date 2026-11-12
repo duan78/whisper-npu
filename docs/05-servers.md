@@ -5,9 +5,14 @@ internally ([the rule](07-npu-rules.md)).
 
 ## Option A: persistent engine + REST proxy (simple)
 
-- **Engine**: the fork's `whisper-server.exe` (rebuilt with our patch — the stock one
-  segfaults on VAD). Loads the model **once** (ggml + `.rai` NPU context stay
-  resident), serves `POST /inference` at ~1.1-1.4 s per utterance.
+- **Engine**: the fork's `whisper-server.exe` from the `build/` tree (VITISAI). Loads
+  the model **once** (ggml + `.rai` NPU context stay resident), serves `POST /inference`
+  at ~1.1-1.4 s per utterance. Runs with a **silero VAD gate** (`--vad --vad-model`,
+  re-verified 2026-11-12, no segfault): without it the decoder hallucinates on
+  silence/noise (« Sous-titrage Société Radio-Canada » on pure silence); with it,
+  mean WER −43 %, p90 50→18 % on the arbitrated corpus, silence/noise → empty,
+  +0 s latency on short utterances. Note: `build-pipe/`'s `--vad` is a silent no-op —
+  that build is for CLI-batch pipelining only, keep the engine on `build/`.
 - **Proxy**: `scripts/server/npu-asr-server.py` — pure-stdlib Python. Accepts any
   audio format (ffmpeg converts), speaks OpenAI. Forwards to the persistent engine
   (fast path); if the engine is down, falls back to spawning whisper-cli

@@ -9,6 +9,8 @@ Endpoints:
 
 Moteur: whisper-server persistant (fork AMD, modèle ggml + cache .rai résidents sur
 le NPU — zéro rechargement par appel, lancé par start-servers.bat sur :9199, greedy).
+Gate VAD silero sur le moteur ET le repli (sinon hallucinations sur silence/bruit —
+mesuré 2026-11-12 : WER moyen −43 %, p90 50→18 % sur corpus arbitré).
 Repli automatique sur whisper-cli (spawn par requête) si le moteur est down.
 Un seul appel NPU à la fois (verrou) — règle d'or du XDNA 2.
 """
@@ -29,8 +31,10 @@ from urllib.parse import urlsplit
 HOST = "127.0.0.1"
 PORT = 9200
 BASE = os.path.dirname(os.path.abspath(__file__))
-WHISPER = r"C:\Users\Arnaud\dev\whisper.cpp\build-pipe\bin\Release\whisper-cli.exe"
+# build/ (VITISAI) : le --vad de build-pipe est un no-op silencieux (2026-11-12)
+WHISPER = r"C:\Users\Arnaud\dev\whisper.cpp\build\bin\Release\whisper-cli.exe"
 MODEL = r"C:\Users\Arnaud\dev\whisper-npu-bin\models\ggml-large-v3-turbo.bin"
+VADM = r"C:\Users\Arnaud\dev\whisper-npu-bin\models\silero-vad-v6.2.0-ggml.bin"
 MODEL_ID = "whisper-large-v3-turbo"
 TMP = os.path.join(BASE, "tmp")
 os.makedirs(TMP, exist_ok=True)
@@ -94,6 +98,7 @@ def transcribe_spawn(wav, language):
     txt = wav + ".txt"
     r = subprocess.run(
         [WHISPER, "-m", MODEL, "-t", "16", "-bs", "1", "-otxt",
+         "--vad", "--vad-model", VADM,
          "-l", (language or "fr"), "-np", "-f", wav],
         capture_output=True, timeout=600)
     if r.returncode != 0:

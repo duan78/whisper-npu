@@ -9,8 +9,12 @@ REM  2. voice-stream-server ws://127.0.0.1:9201       Realtime-like
 REM  Prerequis : Lemonade lance - port 9000 - pour le mode agent
 REM ============================================================
 cd /d "%~dp0"
-set ENGINE=C:\Users\Arnaud\dev\whisper.cpp\build-pipe\bin\Release\whisper-server.exe
+REM Moteur = build VITISAI (pas build-pipe : le pipeline inter-fichiers ne concerne
+REM que le CLI batch, et le --vad de build-pipe est un no-op silencieux — voir
+REM docs/05-servers.md et bench/TUNING 2026-11-12).
+set ENGINE=C:\Users\Arnaud\dev\whisper.cpp\build\bin\Release\whisper-server.exe
 set MODEL=C:\Users\Arnaud\dev\whisper-npu-bin\models\ggml-large-v3-turbo.bin
+set VADM=C:\Users\Arnaud\dev\whisper-npu-bin\models\silero-vad-v6.2.0-ggml.bin
 
 if not exist silero_vad.onnx (
     echo [ERREUR] silero_vad.onnx manquant dans %CD%
@@ -23,7 +27,7 @@ netstat -ano | findstr /r /c:":9199 .*LISTENING" >nul
 if not errorlevel 1 goto already9199
 
 echo Demarrage du moteur persistant whisper-server - 9199 - chargement ~10 s...
-start "Whisper-Engine (whisper-npu)" /min cmd /c "%ENGINE% -m %MODEL% -l fr --host 127.0.0.1 --port 9199 -bs 1 -t 16"
+start "Whisper-Engine (whisper-npu)" /min cmd /c "%ENGINE% -m %MODEL% -l fr --host 127.0.0.1 --port 9199 -bs 1 -t 16 --vad --vad-model %VADM%"
 set /a tries=0
 
 :wait9199

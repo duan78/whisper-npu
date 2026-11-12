@@ -49,3 +49,25 @@ text → first spoken word: 410 ms (sentence+comma-streamed TTS, stub LLM)
 window-1000 encoder on NPU: 255 ms/window in whisper.cpp (×4.5) — but cos-sim 0.48
 vs 30 s-padded model (out of distribution) and provider default quantization cos-sim
 0.25 vs CPU on the unmodified model. See docs/08.
+
+## Decoding tuning — VAD gate (2026-11-12)
+
+Sweep on 90 arbitrated-corpus files (67 non-circular: truth = orig/vox), greedy
+baseline = engine config, model turbo + .rai NPU:
+
+| Config | WER median | mean | p90 | silence/noise |
+|---|---|---|---|---|
+| greedy, no VAD (old engine) | 3.5 % | 13.0 % | 50.0 % | hallucinates |
+| greedy + initial prompt | 3.8 % | 14.2 % | 50.0 % | hallucinates |
+| **greedy + silero VAD (`build/`)** | 5.3 % | **7.4 %** | **17.8 %** | **empty** |
+| greedy + VAD + beam 5 | 5.0 % | 7.9 % | 16.1 % | empty |
+
+Findings: silero VAD cuts the catastrophic tail (mean −43 %, p90 ÷2.8) and empties
+silence/noise. Initial prompt with a domain lexicon **degrades** quality. Beam 5 adds
+nothing over greedy once VAD is on (+26 % decode). `build-pipe/`'s `--vad` is a silent
+no-op (byte-identical outputs) — engine and fallback switched to `build/` with
+`--vad --vad-model` (start-servers.bat, npu-asr-server.py).
+
+Post-deploy re-measure through facade :9200 — 2 s utterance: 1.10–1.14 s (was
+1.11–1.16 s); 43 s file: 3.60 s (was 3.3–3.5 s); silence and noise → empty text.
+Protocol and raw data: `whisper-bench-real/TUNING-DECODAGE.md`.
