@@ -20,7 +20,7 @@ Voice Stream Server — endpoint WebSocket style « GPT Live » (Realtime API), 
    {"type":"error","message":"..."}
 
  Mode agent=false : transcription seule. Mode stub=true : réponse factice
- (tests sans Lemonade). Moteur : VAD Silero + STT NPU persistant :9199 + Lemonade + Piper.
+ (tests sans Lemonade). Moteur : VAD Silero + STT NPU (npu-asr-server :9200) + Lemonade + Piper.
 """
 import argparse
 import base64

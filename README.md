@@ -2,7 +2,7 @@
 
 **Fast, private speech-to-text on the AMD XDNA 2 NPU — a complete, working, benchmarked stack.**
 
-Runs Whisper `large-v3-turbo` with the encoder fully offloaded to the Ryzen AI NPU (50 TOPS), adds an inter-file pipelining patch (+35% throughput), a persistent OpenAI-compatible API server, and a full local voice-assistant loop (mic → VAD → NPU STT → LLM → TTS) with a Realtime-style WebSocket endpoint.
+Runs Whisper `large-v3-turbo` with the encoder fully offloaded to the Ryzen AI NPU (50 TOPS), adds an inter-file pipelining patch (+35% throughput), a three-tier persistent serving stack (NPU engine → OpenAI-compatible facade → whisper-cli fallback), and a full local voice-assistant loop (mic → VAD → NPU STT → LLM → TTS) with a Realtime-style WebSocket endpoint.
 
 Everything here was built and measured on a real machine (Ryzen AI Max+ 395 "Strix Halo", Windows 11) — including the failure modes nobody documents.
 
@@ -17,7 +17,7 @@ AMD ships an [undocumented fork](https://github.com/amd/whisper.cpp) of whisper.
 - how to build it on Windows (MSVC, not MSYS) with the `flexmlrt` runtime (and where to get it when AMD's portal blocks scripts)
 - the **hard rules of the XDNA 2 NPU** (breaking them silently corrupts output — see below)
 - an **inter-file pipelining** patch to keep the NPU busy during CPU decoding
-- a **persistent HTTP server** (the stock one segfaults on VAD)
+- a **persistent serving stack**: the patched `whisper-server` engine keeps the model + `.rai` NPU context resident (~1.1 s/utterance), an OpenAI-compatible facade fronts it and **falls back to a whisper-cli spawn** if the engine dies — transcription never stops
 - a **voice loop** with speculative transcription and sentence-streamed TTS
 - a documented attempt at **recompiling the `.rai`** with a shorter window, including the measured reasons it fails (Whisper's learned 30 s padding) and the remaining path (provider quantization config)
 
@@ -29,9 +29,11 @@ AMD ships an [undocumented fork](https://github.com/amd/whisper.cpp) of whisper.
 | Full transcription pipeline (greedy) | ×12.5 real-time |
 | WER on 3-source-arbitrated French voice notes | **2.9 % median** (large-v3-turbo) |
 | Model quality on conversational French | tiny: 44 % WER, base: 32 % — **unusable**; only turbo is viable |
-| Persistent server latency (6 s utterance) | ~1.7 s |
-| Voice loop, end of speech → text | **1.57 s** (speculative STT) |
-| Voice loop, text → first spoken word | **0.41 s** (sentence-streamed TTS) |
+| REST API, 1.8 s utterance (persistent engine) | **1.11–1.16 s** |
+| REST API, 40 s dense file (2 NPU windows) | **3.3–3.5 s** |
+| REST API, engine down (spawn fallback) | ~3.5–5.3 s — still works |
+| Voice loop, end of speech → text | **1.46 s** (STT 1.31 s, speculative trigger) |
+| Voice loop, text → first spoken word | **0.41–0.50 s** (sentence-streamed TTS) |
 
 ## The NPU rules (learned the hard way)
 
@@ -67,6 +69,30 @@ whisper-cli -m models\ggml-large-v3-turbo.bin -f audio.wav -l fr -bs 1 -t 16
 
 Full walkthrough with every trap: [docs/01-installation.md](docs/01-installation.md)
 
+## Run the servers (OpenAI-compatible)
+
+```bat
+scripts\server\start-servers.bat     :: engine :9199 + API :9200 + WS :9201 (idempotent)
+scripts\server\stop-servers.bat      :: stops all three
+```
+
+The three tiers (see [docs/05-servers.md](docs/05-servers.md)):
+
+```
+whisper-server.exe  :9199   persistent engine — ggml (1.6 GB) + .rai (742 MB)
+                          loaded ONCE, NPU context resident
+npu-asr-server.py   :9200   OpenAI facade — POST /v1/audio/transcriptions,
+                          falls back to a whisper-cli spawn if the engine dies
+voice-stream-server.py :9201  WebSocket "Realtime API" (voice loop endpoint)
+```
+
+```bash
+# any OpenAI client works as-is
+curl http://127.0.0.1:9200/v1/audio/transcriptions \
+  -F file=@note.opus -F model=whisper-large-v3-turbo -F language=fr
+# -> {"text": "..."} in ~1.1 s (1.8 s utterance, engine up)
+```
+
 ## What's inside
 
 ```
@@ -74,7 +100,10 @@ whisper-npu/
 ├── patches/                 the fork modifications (pipelining, VAD fix, ORT bridge)
 ├── scripts/
 │   ├── build/               MSVC build scripts (base / pipeline / ORT / server)
-│   ├── server/              OpenAI-compatible ASR server, voice loop, WebSocket endpoint
+│   ├── server/              serving stack: start/stop-servers.bat,
+│   │                        npu-asr-server.py (OpenAI facade),
+│   │                        voice-stream-server.py (WS realtime),
+│   │                        voice-loop.py (mic loop) + local VAD/TTS models (gitignored)
 │   ├── tools/               benchmarks, model comparison, report generation
 │   └── dataset/             3-source transcription arbitration, .rai recompilation
 ├── docs/                    the knowledge (see index below)

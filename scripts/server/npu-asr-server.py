@@ -7,26 +7,38 @@ Endpoints:
   GET  /v1/models
   GET  /health
 
-Moteur: whisper-cli (fork AMD, encodeur large-v3-turbo sur NPU XDNA 2), greedy,
-VitisAI. Un seul appel NPU à la fois (verrou) — règle d'or du XDNA 2.
+Moteur: whisper-server persistant (fork AMD, modèle ggml + cache .rai résidents sur
+le NPU — zéro rechargement par appel, lancé par start-servers.bat sur :9199, greedy).
+Repli automatique sur whisper-cli (spawn par requête) si le moteur est down.
+Un seul appel NPU à la fois (verrou) — règle d'or du XDNA 2.
 """
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
 
 HOST = "127.0.0.1"
 PORT = 9200
+BASE = os.path.dirname(os.path.abspath(__file__))
 WHISPER = r"C:\Users\Arnaud\dev\whisper.cpp\build-pipe\bin\Release\whisper-cli.exe"
 MODEL = r"C:\Users\Arnaud\dev\whisper-npu-bin\models\ggml-large-v3-turbo.bin"
 MODEL_ID = "whisper-large-v3-turbo"
-TMP = r"C:\Users\Arnaud\dev\npu-asr\tmp"
+TMP = os.path.join(BASE, "tmp")
 os.makedirs(TMP, exist_ok=True)
+
+# moteur persistant (voir start-servers.bat) — surchargeable via BACKEND_URL
+BACKEND_URL = os.environ.get("BACKEND_URL", "http://127.0.0.1:9199/inference")
+_u = urlsplit(BACKEND_URL)
+BACKEND_ADDR = (_u.hostname or "127.0.0.1", _u.port or 80)
 
 npu_lock = threading.Lock()  # un seul forward NPU à la fois
 
@@ -58,6 +70,40 @@ def parse_multipart(body, content_type):
     return fields, files
 
 
+def transcribe_backend(wav):
+    """Chemin rapide : moteur persistant :9199 (modèle + .rai résidents).
+    Retourne le texte, ou None si le moteur est injoignable (repli whisper-cli)."""
+    with open(wav, "rb") as f:
+        wav_bytes = f.read()
+    boundary = "----npuasr" + str(int(time.time() * 1000))
+    body = (("--" + boundary + "\r\n"
+             'Content-Disposition: form-data; name="file"; filename="utt.wav"\r\n'
+             "Content-Type: audio/wav\r\n\r\n").encode()
+            + wav_bytes
+            + ("\r\n--" + boundary + "\r\n"
+               'Content-Disposition: form-data; name="response_format"\r\n\r\njson\r\n'
+               "--" + boundary + "--\r\n").encode())
+    req = urllib.request.Request(BACKEND_URL, data=body,
+                                 headers={"Content-Type": "multipart/form-data; boundary=" + boundary})
+    with urllib.request.urlopen(req, timeout=600) as r:
+        return " ".join(json.loads(r.read().decode("utf-8")).get("text", "").split())
+
+
+def transcribe_spawn(wav, language):
+    """Chemin de repli : spawn whisper-cli (paye ~1,4 s de chargement modèle+.rai)."""
+    txt = wav + ".txt"
+    r = subprocess.run(
+        [WHISPER, "-m", MODEL, "-t", "16", "-bs", "1", "-otxt",
+         "-l", (language or "fr"), "-np", "-f", wav],
+        capture_output=True, timeout=600)
+    if r.returncode != 0:
+        raise RuntimeError("whisper rc=" + str(r.returncode))
+    if not os.path.exists(txt):
+        raise RuntimeError("whisper: aucune sortie")
+    with open(txt, encoding="utf-8", errors="replace") as f:
+        return " ".join(f.read().split())
+
+
 def transcribe(audio_bytes, filename, language):
     """Sauvegarde, convertit en wav 16k mono, transcrit sur NPU. Retourne (texte, durée_audio)."""
     suffix = os.path.splitext(filename)[1] or ".bin"
@@ -77,21 +123,17 @@ def transcribe(audio_bytes, filename, language):
         with wave.open(wav) as w:
             duration = w.getnframes() / w.getframerate()
 
-        txt = wav + ".txt"
         with npu_lock:  # règle NPU : jamais deux forwards simultanés
             t0 = time.time()
-            r = subprocess.run(
-                [WHISPER, "-m", MODEL, "-t", "16", "-bs", "1", "-otxt",
-                 "-l", (language or "fr"), "-np", "-f", wav],
-                capture_output=True, timeout=600)
+            text = None
+            try:
+                text = transcribe_backend(wav)
+                engine = "persistant"
+            except (OSError, urllib.error.URLError, ValueError):
+                text = transcribe_spawn(wav, language)
+                engine = "repli whisper-cli"
             elapsed = time.time() - t0
-        if r.returncode != 0:
-            raise RuntimeError("whisper rc=" + str(r.returncode))
-        if not os.path.exists(txt):
-            raise RuntimeError("whisper: aucune sortie")
-        with open(txt, encoding="utf-8", errors="replace") as f:
-            text = f.read().strip()
-        sys.stderr.write(f"[npu-asr] {filename} {duration:.1f}s audio -> {elapsed:.1f}s NPU\n")
+        sys.stderr.write(f"[npu-asr] {filename} {duration:.1f}s audio -> {elapsed:.1f}s NPU ({engine})\n")
         return text, duration
     finally:
         for p in (src, wav, wav + ".txt"):
@@ -114,7 +156,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
-            self._json(200, {"status": "ok", "engine": "npu-vitisai", "model": MODEL_ID})
+            try:
+                with socket.create_connection(BACKEND_ADDR, timeout=1):
+                    backend = "up (persistant)"
+            except OSError:
+                backend = "down (repli whisper-cli)"
+            self._json(200, {"status": "ok", "engine": "npu-vitisai",
+                             "backend": backend, "model": MODEL_ID})
         elif self.path == "/v1/models":
             self._json(200, {"object": "list", "data": [
                 {"id": MODEL_ID, "object": "model", "owned_by": "local-npu"}]})

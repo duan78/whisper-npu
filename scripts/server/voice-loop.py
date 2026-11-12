@@ -2,7 +2,7 @@
 """
 Voice Loop v2 — discussion naturelle locale, latence minimisée.
 
-Chaîne : Micro → VAD Silero → STT NPU (:9199) → LLM Lemonade (:9000) → TTS Piper.
+Chaîne : Micro → VAD Silero → STT NPU (npu-asr-server :9200) → LLM Lemonade (:9000) → TTS Piper.
 
 Optimisations v2 :
 - STT en worker thread : l'écoute ne bloque jamais, même pendant transcription/LLM/TTS
@@ -31,8 +31,11 @@ import sounddevice as sd
 BASE = os.path.dirname(os.path.abspath(__file__))
 SR = 16000
 
-STT_URL = "http://127.0.0.1:9199/inference"
-LLM_URL = "http://127.0.0.1:9000/api/v1/chat-completions"
+# STT : npu-asr-server.py (ce dépôt, port 9200) — même format multipart que l'API
+# OpenAI. Surchargés par les variables d'environnement STT_URL / LLM_URL
+# (ex. pour viser un autre moteur).
+STT_URL = os.environ.get("STT_URL", "http://127.0.0.1:9200/v1/audio/transcriptions")
+LLM_URL = os.environ.get("LLM_URL", "http://127.0.0.1:9000/api/v1/chat-completions")
 SYSTEM_PROMPT = (
     "Tu es un assistant vocal local. Tu réponds en français, de façon naturelle et "
     "concise : 1 à 3 phrases, style parlé, pas de listes ni de markdown. "

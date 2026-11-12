@@ -31,6 +31,14 @@ turbo: WER median 2.9 %, mean 19.3 %*, 72/100 < 10 % — adopted
 
 2 s utterance: 1.41 s · 6 s: 1.44 s · 14 s: 1.77 s (fixed 30 s window — see docs/07)
 
+## Serving stack re-measure (2026-11-12, facade :9200 → engine :9199)
+
+1.8 s utterance, engine up: 1.11–1.16 s (×3) · 40 s dense file: 3.3–3.5 s (2 windows)
+Fallback (engine down, whisper-cli spawn): 3.5–5.3 s — spawn pays 1335 ms
+model+.rai load each call (encode 887 ms, decode 288 ms for a 6 s file).
+Voice loop through the facade: STT 1.31 s · end of speech → text 1.46 s ·
+text → first spoken word 0.50 s (stub LLM).
+
 ## Voice loop (simulated real-time mic)
 
 end of speech → text: 1.57 s (STT 1.42 s, speculative trigger at 150 ms silence)

@@ -44,6 +44,26 @@ Persistent server, turbo:
 
 The fixed 30 s window dominates — see [07-npu-rules](07-npu-rules.md).
 
+## Serving stack (2026-11-12, facade :9200 → persistent engine :9199)
+
+| Request | Latency | Notes |
+|---|---|---|
+| 1.8 s utterance, engine up | **1.11–1.16 s** (×3 runs) | fast path: resident model + `.rai` |
+| 40 s dense file, engine up | **3.3–3.5 s** | 2 NPU windows (0.9 s each) + ~1.3 s decode |
+| 1.8 s utterance, engine down (fallback) | 3.5–5.3 s | whisper-cli spawn — still transcribes |
+
+Why the fallback is slower — per-spawn phase breakdown (6 s file, whisper-cli):
+
+| Phase | Time | Paid |
+|---|---|---|
+| load (ggml 1.6 GB + `.rai` context init) | 1335 ms | every spawn |
+| encode (NPU) | 887 ms | every request |
+| decode (CPU, 41 tokens × 7 ms) | 288 ms | every request |
+
+The persistent engine pays the 1335 ms **once at boot**; each request is then just
+encode + decode. This is why the engine-first architecture exists — and why the
+fallback exists: if the engine crashes, transcription survives at +2 s.
+
 ## Inter-file pipeline
 
 Batch of 30 mixed files (turbo, greedy), single model load:
@@ -64,8 +84,8 @@ Simulated real-time microphone (audio injected at capture speed), turbo + Silero
 
 | Stage | Measured |
 |---|---|
-| End of speech → text (speculative trigger at 150 ms silence) | **1.57 s** (STT itself 1.42 s) |
-| Text → first spoken word (sentence-streamed TTS, stub LLM) | **0.41 s** |
+| End of speech → text (speculative trigger at 150 ms silence) | **1.57 s** (STT 1.42 s, original direct-engine setup) · **1.46 s** (STT 1.31 s, re-measured 2026-11-12 through facade + persistent engine) |
+| Text → first spoken word (sentence-streamed TTS, stub LLM) | **0.41 s** (0.50 s re-measured) |
 
 ## Dataset verification (the workload that motivated everything)
 

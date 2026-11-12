@@ -5,6 +5,10 @@ __pycache__/
 *.wav
 *.opus
 *.ogg
+# modèles vocaux locaux (VAD/TTS — trop gros pour git, voir docs/06-voice-loop.md)
+*.onnx
+*.onnx.json
+scripts/server/tmp/
 # secrets — ne jamais committer de clé
 .mistral-key
 *.key

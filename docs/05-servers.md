@@ -6,17 +6,21 @@ internally ([the rule](07-npu-rules.md)).
 ## Option A: persistent engine + REST proxy (simple)
 
 - **Engine**: the fork's `whisper-server.exe` (rebuilt with our patch — the stock one
-  segfaults on VAD). Loads the model **once**, serves `POST /inference` at ~1.4-1.8 s
-  per utterance.
+  segfaults on VAD). Loads the model **once** (ggml + `.rai` NPU context stay
+  resident), serves `POST /inference` at ~1.1-1.4 s per utterance.
 - **Proxy**: `scripts/server/npu-asr-server.py` — pure-stdlib Python. Accepts any
-  audio format (ffmpeg converts), speaks OpenAI.
+  audio format (ffmpeg converts), speaks OpenAI. Forwards to the persistent engine
+  (fast path); if the engine is down, falls back to spawning whisper-cli
+  (~+2 s model reload — transcription still works, just slower).
 
-```bash
-python scripts/server/npu-asr-server.py   # http://127.0.0.1:9200
+```bat
+scripts\server\start-servers.bat    :: engine :9199 + proxy :9200 + WS :9201 (idempotent)
+scripts\server\stop-servers.bat     :: stops all three
 ```
 
 Endpoints: `POST /v1/audio/transcriptions` (multipart: `file`, `language`,
-`response_format` = json|text|verbose_json), `GET /v1/models`, `GET /health`.
+`response_format` = json|text|verbose_json), `GET /v1/models`, `GET /health`
+(reports `"backend": "up (persistant)"` or `"down (repli whisper-cli)"`).
 Tested with the official OpenAI Python SDK:
 
 ```python
@@ -26,9 +30,10 @@ print(client.audio.transcriptions.create(
     model="whisper-large-v3-turbo", file=open("note.ogg", "rb"), language="fr").text)
 ```
 
-Latency: ~4.5 s per request (the proxy spawns whisper-cli → pays a 2.2 s model load
-each time). Prefer Option B's engine for interactive use; keep this proxy for
-integration with OpenAI-speaking tools.
+Latency: **~1.1-1.5 s per request** with the engine up (measured: 1.11-1.16 s for a
+1.8 s utterance); ~3.5-5 s in fallback mode. The engine is started with `-l fr`;
+requests asking for another language only get it honored in fallback mode — restart
+the engine with the language you need otherwise.
 
 ## Option B: the realtime voice endpoint (WebSocket)
 
